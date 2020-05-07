@@ -1,11 +1,9 @@
 #!/usr/bin/python
 
-import os,sys
+import os,sys, fnmatch
 
-# Assumes kafka module is in a folder parallel to the folder this script exists in.
-# Once we can install pykafka as a separate module, this will be removed.
-sys.path.append(os.path.join(os.path.split(sys.argv[0])[0],'..'))
-import kafka as k
+from kafka import KafkaProducer
+import json
 
 from optparse import OptionParser
 import subprocess
@@ -13,10 +11,11 @@ import atexit
 
 
 should_stop = False
-pending_messages = []
 
 def create_kafka_producer(host,port,topic):
-	return k.producer.Producer(topic,host=host,port=port)
+	return KafkaProducer(bootstrap_servers=[ "{}:{}".format(host, port)],
+                         value_serializer=lambda x: 
+                         json.dumps(x).encode('utf-8'))
 
 def create_message_data(metadata,data):
 	if metadata is not None:
@@ -25,28 +24,43 @@ def create_message_data(metadata,data):
 		return data
 
 def flush_messages(producer):
-	global pending_messages
-	print "flushing %d messages " % len(pending_messages)
-	producer.send(pending_messages)
-	pending_messages = []
+	print ("flushing messages")
+	producer.flush()
+	
 
-def send_to_kafka(producer,message_text,batch_size):
-	global pending_messages
-	pending_messages.append(k.message.Message(message_text))
-	if len(pending_messages) == batch_size:
-		flush_messages(producer)
+def send_to_kafka(producer,topic,message_text):
+	print(message_text)
+	future = producer.send(topic, message_text)
+	result = future.get(timeout=60)
+	print(result)
+	flush_messages(producer)
 
-def log_lines_generator(logfile,delay_between_iterations=None):
+
+
+def log_folder_parser(producer,topic,logfolder,delay_between_iterations=None):
+	print ("parse folder {}".format(logfolder))
+	listOfFiles = os.listdir(logfolder)
+	pattern = "*.audit.log"
+	for file in listOfFiles:
+		if fnmatch.fnmatch(file, pattern):
+				print ("parse file {}".format(file))
+				log_lines_parser(producer, topic, logfolder, file, delay_between_iterations)
+				
+
+	
+
+def log_lines_parser(producer,topic,logfolder,logfile,delay_between_iterations=None):
 	global should_stop
 	cmd = ['tail','-n','0','-F']
 	if delay_between_iterations is not None:
 		cmd.append('-s')
 		cmd.append(delay_between_iterations)
-	cmd.append(logfile)
+	cmd.append("{}{}".format(logfolder, logfile))
+	print(cmd)
 	process = subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=None)
 	while not should_stop:
-		line = process.stdout.readline().strip()
-		yield line
+		line = process.stdout.readline().strip().decode()
+		send_to_kafka(producer,topic,line)
 	
 def main():
 	parser = OptionParser(usage="""
@@ -85,14 +99,14 @@ def main():
 	if options.topic is None or options.logfile is None:
 		parser.print_help()
 		sys.exit(1)
-
+	print("start...")
 	producer = create_kafka_producer(options.host,int(options.port),options.topic)
 	atexit.register(flush_messages,producer)
 	try:
-		for line in log_lines_generator(options.logfile):
-			mt = create_message_data(options.metadata,line)
-			send_to_kafka(producer,mt,int(options.batch_size))
-	except KeyboardInterrupt,e:
+		print("run...")
+		log_folder_parser(producer, options.topic, options.logfile)
+	
+	except KeyboardInterrupt as e:
 		pass
 
 if __name__ == '__main__':
